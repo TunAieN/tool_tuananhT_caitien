@@ -1,0 +1,385 @@
+﻿using System.Text;
+using System.Text.Json;
+using ToolTikTokV11.Models;
+using ToolTikTokV11.Services;
+
+namespace ToolTikTokV11;
+
+public sealed partial class MainForm
+{
+    string _managedDetailSnapshot = "Bước: —";
+    long _managedWindowHandleSnapshot;
+    readonly SemaphoreSlim _managedVideoGate = new(1, 1);
+    readonly SemaphoreSlim _managedChromeStartupGate = new(1, 1);
+    long _managedChromeStartupGeneration;
+    CancellationTokenSource? _managedVideoCts;
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Interlocked.Exchange(ref _managedWindowHandleSnapshot, Handle.ToInt64());
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        Interlocked.Exchange(ref _managedWindowHandleSnapshot, 0);
+        base.OnHandleDestroyed(e);
+    }
+
+    sealed class ManagedIdentityUpdateRequest
+    {
+        public string Username { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+        public string AvatarPath { get; set; } = "";
+        public string Bio { get; set; } = "";
+        public bool SkipIfNameCooldown { get; set; }
+        public string[] KnownDisplayNames { get; set; } = Array.Empty<string>();
+        public bool VerifyExistingState { get; set; }
+        public bool FastNameGuardMode { get; set; }
+    }
+
+    sealed class ManagedNameGuardProbeRequest
+    {
+        public string Username { get; set; } = "";
+        public string[] AllowedDisplayNames { get; set; } = Array.Empty<string>();
+    }
+
+    public Task<string> HandleManagedCommandAsync(string rawCommand)
+    {
+        var raw = (rawCommand ?? "").Trim();
+        var separator = raw.IndexOf('|');
+        var command = (separator >= 0 ? raw[..separator] : raw).Trim().ToLowerInvariant();
+        var commandPayload = separator >= 0 ? raw[(separator + 1)..] : "";
+        if (command == "ping") return Task.FromResult("pong");
+        if (IsDisposed || Disposing) return Task.FromResult("disposed");
+
+        // Status is the hot IPC path (Manager polls every open profile once a
+        // second).  It no longer needs to marshal to WinForms just to read a few
+        // values.  The detail/window values are snapshots maintained by the UI,
+        // while engine/chrome flags are safe lightweight reads.
+        if (command == "status") return Task.FromResult(BuildManagedStatusResponse());
+        if (command == "message_reply_status") return Task.FromResult(BuildManagedMessageReplyStatusResponse());
+        if (command == "message_reply_log") return Task.FromResult(BuildManagedMessageReplyLogResponse());
+        if (command == "message_reply_stop") return Task.FromResult(StopManagedMessageReply());
+        if (command == "video_cancel")
+        {
+            try { _managedVideoCts?.Cancel(); } catch { }
+            return Task.FromResult("video_cancelled");
+        }
+        if (command == "post_tiktok_video")
+            return RunManagedVideoPostAsync(commandPayload);
+
+        return InvokeManagedOnUiAsync(async () =>
+        {
+            switch (command)
+            {
+                case "start":
+                    if (IsMessageReplyRunning) return "message_reply_running";
+                    await StartAsync();
+                    return _engine.Running ? "started" : "not_started";
+                case "start_auto":
+                    if (IsMessageReplyRunning) return "message_reply_running";
+                    await StartAsync(suppressDialogs: true);
+                    return _engine.Running ? "started" : "not_started";
+                case "pause":
+                    if (_engine.Running && !_engine.Paused) _engine.TogglePause();
+                    return _engine.Paused ? "paused" : "not_paused";
+                case "resume":
+                    if (_engine.Running && _engine.Paused) _engine.TogglePause();
+                    return _engine.Running && !_engine.Paused ? "running" : "not_running";
+                case "stop":
+                    _engine.Stop();
+                    return "stopped";
+                case "launch":
+                    await _managedChromeStartupGate.WaitAsync();
+                    try
+                    {
+                        var generation = Interlocked.Increment(ref _managedChromeStartupGeneration);
+                        _log.Info($"[CDP_STARTUP_GENERATION] generation={generation} command=launch");
+                        await LaunchChromeAsync();
+                        if (!_chrome.Connected) return "not_opened";
+                        return MapManagedLaunchState();
+                    }
+                    finally { _managedChromeStartupGate.Release(); }
+                case "launch_auto":
+                    // Auto Profile không giữ cả hàng đợi 15 phút khi gặp CAPTCHA.
+                    // Chrome vẫn được giữ nguyên để người dùng xử lý thủ công sau.
+                    await _managedChromeStartupGate.WaitAsync();
+                    try
+                    {
+                        var generation = Interlocked.Increment(ref _managedChromeStartupGeneration);
+                        _log.Info($"[CDP_STARTUP_GENERATION] generation={generation} command=launch_auto");
+                        await LaunchChromeAsync(stopOnCaptcha: true, suppressDialogs: true);
+                        if (!_chrome.Connected) return "not_opened";
+                        return MapManagedLaunchState();
+                    }
+                    finally { _managedChromeStartupGate.Release(); }
+                case "captcha_check":
+                    if (!_chrome.Connected) return "not_connected";
+                    try { return await _chrome.IsCaptchaVisibleAsync() ? "captcha" : "clear"; }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("[CAPTCHA_CHECK] " + ex.Message);
+                        return "probe_error";
+                    }
+                case "connect":
+                    await _managedChromeStartupGate.WaitAsync();
+                    try
+                    {
+                        var generation = Interlocked.Increment(ref _managedChromeStartupGeneration);
+                        _log.Info($"[CDP_STARTUP_GENERATION] generation={generation} command=connect_or_launch");
+                        await EnsureChromeAsync();
+                        return _chrome.Connected ? "connected" : "disconnected";
+                    }
+                    finally { _managedChromeStartupGate.Release(); }
+                case "close_chrome":
+                    StopManagedMessageReply();
+                    return await CloseChromeAsync();
+                case "message_reply_start":
+                    return await StartManagedMessageReplyAsync(commandPayload);
+                case "identity_ready":
+                {
+                    if (!_chrome.Connected) return "not_connected";
+                    try
+                    {
+                        // TikTok đôi lúc vào đúng trang cá nhân nhưng SPA/session tạm hiện
+                        // như chưa đăng nhập. Tự F5 tối đa 2 lần trước khi báo not_logged_in.
+                        return await _chrome.EnsureTikTokIdentitySessionReadyAsync()
+                            ? "ready"
+                            : "not_logged_in";
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("[TIKTOK_IDENTITY_READY_PROBE] " + ex.Message);
+                        return "probe_error";
+                    }
+                }
+                case "identity_name_probe":
+                {
+                    try
+                    {
+                        if (!_chrome.Connected)
+                            return JsonSerializer.Serialize(new { ok = false, currentName = "", matched = false, currentHandle = "", source = "", message = "Chrome chưa kết nối." });
+                        if (string.IsNullOrWhiteSpace(commandPayload))
+                            throw new InvalidOperationException("Thiếu payload Name Guard.");
+
+                        var json = Encoding.UTF8.GetString(Convert.FromBase64String(commandPayload));
+                        var request = JsonSerializer.Deserialize<ManagedNameGuardProbeRequest>(
+                            json,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                            ?? throw new InvalidOperationException("Payload Name Guard không hợp lệ.");
+
+                        var result = await _chrome.ProbeCurrentAccountDisplayNameAsync(
+                            request.Username,
+                            request.AllowedDisplayNames);
+                        return JsonSerializer.Serialize(new
+                        {
+                            ok = result.Ok,
+                            currentName = result.CurrentName,
+                            matched = result.Matched,
+                            currentHandle = result.CurrentHandle,
+                            source = result.Source,
+                            message = result.Message
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("[NAME_GUARD_PROBE] " + ex.Message);
+                        return JsonSerializer.Serialize(new { ok = false, currentName = "", matched = false, currentHandle = "", source = "", message = ex.Message });
+                    }
+                }
+                case "update_tiktok_identity":
+                {
+                    try
+                    {
+                        if (IsMessageReplyRunning)
+                            throw new InvalidOperationException("Profile đang xử lý Tin nhắn TikTok. Hãy dừng mục Tin nhắn trước khi cập nhật tên/ảnh.");
+                        if (string.IsNullOrWhiteSpace(commandPayload))
+                            throw new InvalidOperationException("Thiếu payload đổi tên/ảnh TikTok.");
+                        var json = Encoding.UTF8.GetString(Convert.FromBase64String(commandPayload));
+                        var request = JsonSerializer.Deserialize<ManagedIdentityUpdateRequest>(
+                            json,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                            ?? throw new InvalidOperationException("Payload đổi tên/ảnh TikTok không hợp lệ.");
+                        if (!request.FastNameGuardMode)
+                        {
+                            if (!await _chrome.EnsureTikTokIdentitySessionReadyAsync())
+                                throw new InvalidOperationException("TikTok chưa đăng nhập sau khi Tool đã F5 thử lại 2 lần. Hãy kiểm tra tài khoản trên Chrome rồi cập nhật tên/ảnh lại.");
+
+                            // Luồng Tên/ảnh đầy đủ giữ recovery cũ. Name Guard nhanh đã đứng
+                            // ở trang Hồ sơ nên bỏ các bước chuẩn bị/F5 lặp này.
+                            await _chrome.EnsureTikTokEditProfileEntranceReadyAsync();
+                        }
+
+                        var result = await _chrome.UpdateTikTokProfileIdentityAsync(
+                            request.Username, request.DisplayName, request.AvatarPath, request.Bio,
+                            request.SkipIfNameCooldown, request.KnownDisplayNames, request.VerifyExistingState,
+                            request.FastNameGuardMode);
+                        return JsonSerializer.Serialize(new
+                        {
+                            ok = result.IsSuccessful,
+                            nameChanged = result.NameChanged,
+                            avatarChanged = result.AvatarChanged,
+                            bioChanged = result.BioChanged,
+                            nameCooldown = result.NameCooldown,
+                            alreadyConfigured = result.AlreadyConfigured,
+                            skipped = result.Skipped,
+                            status = result.Status.ToString(),
+                            nameVerified = result.NameVerified,
+                            avatarVerified = result.AvatarVerified,
+                            bioVerified = result.BioVerified,
+                            saveClicked = result.SaveClicked,
+                            nameSaveAttempted = result.NameSaveAttempted,
+                            doNotRetryName = result.DoNotRetryName,
+                            message = result.Message,
+                            error = result.IsSuccessful ? "" : result.Message
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        return JsonSerializer.Serialize(new
+                        {
+                            ok = false,
+                            nameChanged = false,
+                            avatarChanged = false,
+                            bioChanged = false,
+                            nameCooldown = false,
+                            alreadyConfigured = false,
+                            skipped = false,
+                            status = "FAILED",
+                            nameVerified = (bool?)null,
+                            avatarVerified = (bool?)null,
+                            bioVerified = (bool?)null,
+                            saveClicked = false,
+                            message = "",
+                            error = ex.Message
+                        });
+                    }
+                }
+                case "view_chrome":
+                {
+                    var profilePath = _startupOptions.ProfilePath;
+                    if (string.IsNullOrWhiteSpace(profilePath)) return "window_not_found";
+                    if (!_chrome.Connected) return "not_connected";
+
+                    // Resolve PID/HWND theo đúng CDP port + profile path và retry
+                    // EnumWindows tại Worker. Không restore, restart hoặc đổi
+                    // foreground ở đây; Manager vẫn là nơi điều khiển cửa sổ.
+                    var resolution = await _chrome.ResolveManagedWindowAsync(
+                        profilePath,
+                        _settings.ChromePort,
+                        windowAttempts: 8,
+                        retryDelayMs: 250);
+                    return JsonSerializer.Serialize(resolution);
+                }
+                case "show":
+                    if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                    Show();
+                    return "shown";
+                case "shutdown":
+                    StopManagedMessageReply();
+                    BeginInvoke(new Action(Close));
+                    return "bye";
+                default:
+                    return "unknown";
+            }
+        });
+    }
+
+    async Task<string> RunManagedVideoPostAsync(string commandPayload)
+    {
+        if (string.IsNullOrWhiteSpace(commandPayload))
+            return JsonSerializer.Serialize(new TikTokVideoPostResult { Error = "Thiếu payload đăng video." });
+        if (!_chrome.Connected)
+            return JsonSerializer.Serialize(new TikTokVideoPostResult { Error = "Chrome chưa kết nối." });
+
+        await _managedVideoGate.WaitAsync();
+        try
+        {
+            var json = Encoding.UTF8.GetString(Convert.FromBase64String(commandPayload));
+            var options = JsonSerializer.Deserialize<TikTokVideoPostOptions>(json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                ?? throw new InvalidOperationException("Payload đăng video không hợp lệ.");
+            using var cts = new CancellationTokenSource();
+            _managedVideoCts = cts;
+            var service = new TikTokVideoUploadService(_chrome, _log);
+            return JsonSerializer.Serialize(await service.PostAsync(options, cts.Token));
+        }
+        catch (Exception ex)
+        {
+            _log.Error("[VIDEO][ERROR] " + ex);
+            return JsonSerializer.Serialize(new TikTokVideoPostResult { Error = ex.Message });
+        }
+        finally
+        {
+            _managedVideoCts = null;
+            _managedVideoGate.Release();
+        }
+    }
+
+    string MapManagedLaunchState()
+        => _startupPreparationState switch
+        {
+            "CAPTCHA_REQUIRED" => "captcha_required",
+            "TOTP_REQUIRED" => "totp_required",
+            "NEED_MANUAL" => "need_manual",
+            "MAIL_TOKEN_INVALID" => "mail_token_invalid",
+            "MAIL_PERMISSION_ERROR" => "mail_permission_error",
+            "MAIL_API_ERROR" => "mail_api_error",
+            "OTP_TIMEOUT" => "otp_timeout",
+            "OTP_NOT_FOUND" => "otp_not_found",
+            "OTP_INVALID" => "otp_invalid",
+            "OTP_SUBMIT_FAILED" => "otp_submit_failed",
+            "LOGIN_REQUIRED" => "login_required",
+            "LOGIN_FAILED" => "login_failed",
+            "LOGIN_FORM_NOT_FOUND" => "login_form_not_found",
+            "ERROR" => "startup_error",
+            _ => "opened"
+        };
+
+    string BuildManagedStatusResponse()
+    {
+        var profile = _managedMode && !string.IsNullOrWhiteSpace(_startupOptions.ProfileName)
+            ? _startupOptions.ProfileName
+            : CurrentProfileName;
+        var periodic = _engine.GetPeriodicF5Snapshot();
+        // Tận dụng RuntimeStatsTracker đã có trong Worker; Dashboard chỉ đọc snapshot này,
+        // không tạo thêm bộ đếm/thời gian riêng ở Manager.
+        var runtime = _runtimeStats.GetSnapshot();
+        var f5RemainingSec = periodic.Enabled && periodic.DueAt != DateTime.MaxValue
+            ? Math.Max(0, (int)Math.Ceiling((periodic.DueAt - DateTime.Now).TotalSeconds))
+            : -1;
+        return JsonSerializer.Serialize(new
+        {
+            Profile = profile,
+            State = "WORKER_READY",
+            RunState = !_engine.Running ? "STOPPED" : _engine.Paused ? "PAUSED" : "RUNNING",
+            Detail = Volatile.Read(ref _managedDetailSnapshot),
+            Chrome = _chrome.Connected ? "CONNECTED" : "DISCONNECTED",
+            CdpPort = _settings.ChromePort,
+            Pid = Environment.ProcessId,
+            WindowHandle = Interlocked.Read(ref _managedWindowHandleSnapshot),
+            ChromeWindowHandle = _chrome.GetManagedWindowHandleValue(),
+            Viewer = _engine.LastViewerValue,
+            Step = _engine.CurrentStep,
+            Rounds = _engine.Rounds,
+            TotalRunSeconds = Math.Max(0L, (long)Math.Round(runtime.Total.TotalSeconds)),
+            F5Enabled = periodic.Enabled,
+            F5RemainingSec = f5RemainingSec
+            ,TikTokStartupState = _startupPreparationState
+            ,MessageReplyRunning = IsMessageReplyRunning
+        });
+    }
+
+    Task<string> InvokeManagedOnUiAsync(Func<Task<string>> action)
+    {
+        if (!InvokeRequired) return action();
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        BeginInvoke(new Action(async () =>
+        {
+            try { tcs.TrySetResult(await action()); }
+            catch (Exception ex) { tcs.TrySetException(ex); }
+        }));
+        return tcs.Task;
+    }
+}
