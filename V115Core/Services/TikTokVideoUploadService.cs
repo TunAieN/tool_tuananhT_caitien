@@ -14,7 +14,7 @@ public sealed class TikTokVideoUploadService
         "VIDEO_POST_EDITOR_SETTLE|VIDEO_AUTO_CONTENT_CHECK_MODAL|VIDEO_DESCRIPTION_SEARCH|" +
         "VIDEO_PHONE_PREVIEW_TIP|VIDEO_DESCRIPTION_CANDIDATE_SCORE|VIDEO_DESCRIPTION_CLEAR_VERIFY|" +
         "VIDEO_CAPTION_CONFIG|VIDEO_CAPTION_SET|VIDEO_CAPTION_EDITOR_FOCUS|VIDEO_CAPTION_INPUT_ATTEMPT|" +
-        "VIDEO_CAPTION_INPUT_RESULT|VIDEO_CAPTION_DOM_DIAGNOSTIC|VIDEO_CAPTION_CANONICAL_READ|" +
+        "VIDEO_CAPTION_INPUT_RESULT|VIDEO_CAPTION_EVENT_DIAGNOSTIC|VIDEO_CAPTION_DOM_DIAGNOSTIC|VIDEO_CAPTION_CANONICAL_READ|" +
         "VIDEO_CAPTION_SETTLE|VIDEO_CAPTION_VERIFY|VIDEO_DESCRIPTION_GATE|" +
         "VIDEO_BLOCKING_MODAL_SCAN|VIDEO_BLOCKING_MODAL_CANDIDATE|VIDEO_VISIBILITY_INTERACTION_PROBE|" +
         "VIDEO_UNKNOWN_BLOCKING_MODAL|VIDEO_VISIBILITY_CONTAINER|VIDEO_VISIBILITY_STATE|VIDEO_VISIBILITY_GATE|" +
@@ -974,7 +974,8 @@ public sealed class TikTokVideoUploadService
             $"sanitizedInnerHTML={snapshot.SanitizedInnerHtml}");
     }
 
-    async Task<(bool Success, string Mechanism)> SetCaptionOnceAsync(string caption, CancellationToken ct)
+    async Task<(bool Success, string Mechanism)> SetCaptionOnceAsync(
+        string caption, string requestedStrategy, CancellationToken ct)
     {
         var captionJson = JsonSerializer.Serialize(caption);
         var token = "tt-caption-" + Guid.NewGuid().ToString("N");
@@ -994,17 +995,18 @@ public sealed class TikTokVideoUploadService
   }
   if(!el.isContentEditable)return 'UNSUPPORTED';
   el.setAttribute('data-codex-caption-target',token);
-  return 'DRAFTJS_FOCUSED_CDP_INSERT_TEXT';
+  return __STRATEGY__;
 })()
 """.Replace("__CAPTION__", captionJson, StringComparison.Ordinal)
-   .Replace("__TOKEN__", tokenJson, StringComparison.Ordinal), ct: ct);
+   .Replace("__TOKEN__", tokenJson, StringComparison.Ordinal)
+   .Replace("__STRATEGY__", JsonSerializer.Serialize(requestedStrategy), StringComparison.Ordinal), ct: ct);
         var mechanism = targetResponse.TryGetProperty("value", out var targetValue)
             && targetValue.ValueKind == JsonValueKind.String
                 ? targetValue.GetString() ?? ""
                 : "";
         if (mechanism == "VALUE_NATIVE_SETTER")
             return (true, mechanism);
-        if (mechanism != "DRAFTJS_FOCUSED_CDP_INSERT_TEXT")
+        if (mechanism is not ("DRAFTJS_KEYBOARD_TYPING" or "DRAFTJS_EXEC_COMMAND_FALLBACK"))
             return (false, mechanism.Length > 0 ? mechanism : "TARGET_PROBE_FAILED");
 
         try
@@ -1050,20 +1052,100 @@ public sealed class TikTokVideoUploadService
             if (!focused || !activeInsideEditor || selectionRangeCount == 0 || !selectionCollapsed || !selectionAnchorInsideEditor)
                 return (false, mechanism);
 
-            await _chrome.InsertFocusedTextAsync(caption, ct);
-            return (true, mechanism);
+            await _chrome.EvalAsync("""
+(() => {
+  const el=window.__ttVideoDescriptionEditor;
+  if(!el?.isConnected)return false;
+  const counts={keydown:0,beforeinput:0,input:0,keyup:0,inputTypes:{}};
+  const handlers={};
+  for(const type of ['keydown','beforeinput','input','keyup']){
+    handlers[type]=event=>{counts[type]++;if((type==='beforeinput'||type==='input')&&event.inputType)counts.inputTypes[event.inputType]=(counts.inputTypes[event.inputType]||0)+1};
+    el.addEventListener(type,handlers[type],true);
+  }
+  window.__ttCaptionEventDiagnostic={el,counts,handlers};
+  return true;
+})()
+""", ct: ct);
+
+            bool dispatched;
+            if (mechanism == "DRAFTJS_KEYBOARD_TYPING")
+            {
+                await _chrome.TypeFocusedTextByKeyboardAsync(caption, 15, ct);
+                dispatched = true;
+            }
+            else
+            {
+                var captionJsonForFallback = JsonSerializer.Serialize(caption);
+                var fallbackResponse = await _chrome.EvalAsync("""
+(() => {
+  const el=window.__ttVideoDescriptionEditor,value=__CAPTION__;
+  if(!el?.isConnected||document.activeElement!==el)return false;
+  try{return document.execCommand('insertText',false,value)}catch{return false}
+})()
+""".Replace("__CAPTION__", captionJsonForFallback, StringComparison.Ordinal), ct: ct);
+                dispatched = ReadBool(fallbackResponse);
+            }
+            await Task.Delay(75, ct);
+            var eventResponse = await _chrome.EvalAsync("""
+(() => {
+  const diagnostic=window.__ttCaptionEventDiagnostic;
+  if(!diagnostic)return {keydown:0,beforeinput:0,input:0,keyup:0,inputTypes:{}};
+  for(const [type,handler] of Object.entries(diagnostic.handlers))diagnostic.el.removeEventListener(type,handler,true);
+  delete window.__ttCaptionEventDiagnostic;
+  return diagnostic.counts;
+})()
+""", ct: ct);
+            var events = ReadObject(eventResponse);
+            _log.Info(
+                $"[VIDEO][CAPTION_EVENT_DIAGNOSTIC] strategy={mechanism} " +
+                $"keydown={ReadInteger(events, "keydown")} beforeinput={ReadInteger(events, "beforeinput")} " +
+                $"input={ReadInteger(events, "input")} keyup={ReadInteger(events, "keyup")} " +
+                $"inputTypes={(events.TryGetProperty("inputTypes", out var inputTypes) ? inputTypes.GetRawText() : "{}")}");
+            return (dispatched, mechanism);
         }
         finally
         {
             await _chrome.EvalAsync("""
 (() => {
   const el=window.__ttVideoDescriptionEditor;
+  const diagnostic=window.__ttCaptionEventDiagnostic;
+  if(diagnostic){for(const [type,handler] of Object.entries(diagnostic.handlers))diagnostic.el.removeEventListener(type,handler,true);delete window.__ttCaptionEventDiagnostic}
   if(el?.getAttribute('data-codex-caption-target')===__TOKEN__)
     el.removeAttribute('data-codex-caption-target');
   return true;
 })()
 """.Replace("__TOKEN__", tokenJson, StringComparison.Ordinal), ct: ct);
         }
+    }
+
+    async Task<bool> ClearDescriptionForCaptionFallbackAsync(string filenameStem, CancellationToken ct)
+    {
+        var search = await FindDescriptionEditorAsync(filenameStem, ct);
+        if (!search.Found) return false;
+        var clearResponse = await _chrome.EvalAsync("""
+(() => {
+  const el=window.__ttVideoDescriptionEditor;
+  if(!el?.isConnected)return false;
+  el.focus();
+  const selection=getSelection(),range=document.createRange();
+  range.selectNodeContents(el);selection.removeAllRanges();selection.addRange(range);
+  el.dispatchEvent(new InputEvent('beforeinput',{bubbles:true,cancelable:true,inputType:'deleteContentBackward',data:null}));
+  document.execCommand('delete',false);
+  if((el.innerText||el.textContent||'').replace(/[\u200B-\u200D\uFEFF\u00A0\s]/g,'').length)el.replaceChildren();
+  el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));
+  return true;
+})()
+""", ct: ct);
+        var dispatched = ReadBool(clearResponse);
+        await Task.Delay(400, ct);
+        search = await FindDescriptionEditorAsync(filenameStem, ct);
+        var actual = search.Found ? await ReadDescriptionAsync(ct) : "\0";
+        var actualLength = actual == "\0" ? -1 : NormalizeDescription(actual).Length;
+        var cleared = dispatched && actualLength == 0;
+        _log.Info(
+            $"[VIDEO][CAPTION_INPUT_FALLBACK_CLEAR] dispatched={dispatched.ToString().ToLowerInvariant()} " +
+            $"actualLength={actualLength} result={(cleared ? "PASS" : "FAIL")}");
+        return cleared;
     }
 
     async Task<string> ConfigureCaptionAsync(TikTokVideoPostOptions options, bool handledModal, CancellationToken ct)
@@ -1117,44 +1199,71 @@ public sealed class TikTokVideoUploadService
 
         if (fixedCaptionConfigured)
         {
-            _log.Info(
-                $"[VIDEO][CAPTION_INPUT_ATTEMPT] attempt=1/1 strategy=DRAFTJS_FOCUSED_CDP_INSERT_TEXT " +
-                $"expectedLength={normalizedConfiguredCaption.Length}");
-            var setResult = await SetCaptionOnceAsync(configuredCaption, ct);
+            var strategies = new[] { "DRAFTJS_KEYBOARD_TYPING", "DRAFTJS_EXEC_COMMAND_FALLBACK" };
+            var emptySnapshot = new DescriptionDomSnapshot(
+                false, "", "", "", "", "", "", 0, 0, 0, "[]", "[]", "{}", "{}", "[]", "");
+            var finalSnapshot = emptySnapshot;
+            var finalMechanism = strategies[0];
+            var inputDispatched = false;
+            var exactCanonicalMatch = false;
 
-            search = await FindDescriptionEditorAsync(filenameStem, ct);
-            var settle = search.Found
-                ? await WaitForCaptionEditorSettleAsync(ct)
-                : (new DescriptionDomSnapshot(false, "", "", "", "", "", "", 0, 0, 0, "[]", "[]", "{}", "{}", "[]", ""), 0L, false);
-            _log.Info($"[VIDEO][CAPTION_SETTLE] elapsedMs={settle.Item2} stable={settle.Item3.ToString().ToLowerInvariant()}");
-            LogCaptionDomDiagnostic(settle.Item1);
-            var actualCaptionFound = settle.Item1.Found;
-            var normalizedActualCaption = actualCaptionFound ? NormalizeDescription(settle.Item1.CanonicalText) : "";
-            var exactCanonicalMatch = setResult.Success
-                && actualCaptionFound
-                && string.Equals(normalizedActualCaption, normalizedConfiguredCaption, StringComparison.Ordinal);
-            _log.Info(
-                $"[VIDEO][CAPTION_INPUT_RESULT] attempt=1/1 strategy={setResult.Mechanism} " +
-                $"actualLength={(actualCaptionFound ? normalizedActualCaption.Length : -1)} " +
-                $"exactMatch={exactCanonicalMatch.ToString().ToLowerInvariant()}");
+            for (var attempt = 1; attempt <= strategies.Length; attempt++)
+            {
+                var strategy = strategies[attempt - 1];
+                if (attempt > 1 && !await ClearDescriptionForCaptionFallbackAsync(filenameStem, ct))
+                    break;
+
+                _log.Info(
+                    $"[VIDEO][CAPTION_INPUT_ATTEMPT] attempt={attempt}/{strategies.Length} strategy={strategy} " +
+                    $"expectedLength={normalizedConfiguredCaption.Length}");
+                var setResult = await SetCaptionOnceAsync(configuredCaption, strategy, ct);
+                finalMechanism = setResult.Mechanism;
+                inputDispatched = setResult.Success;
+
+                search = await FindDescriptionEditorAsync(filenameStem, ct);
+                var settle = search.Found
+                    ? await WaitForCaptionEditorSettleAsync(ct)
+                    : (emptySnapshot, 0L, false);
+                finalSnapshot = settle.Item1;
+                _log.Info(
+                    $"[VIDEO][CAPTION_SETTLE] attempt={attempt}/{strategies.Length} " +
+                    $"elapsedMs={settle.Item2} stable={settle.Item3.ToString().ToLowerInvariant()}");
+                LogCaptionDomDiagnostic(finalSnapshot);
+                var actualFoundForAttempt = finalSnapshot.Found;
+                var normalizedActualForAttempt = actualFoundForAttempt
+                    ? NormalizeDescription(finalSnapshot.CanonicalText)
+                    : "";
+                exactCanonicalMatch = setResult.Success
+                    && actualFoundForAttempt
+                    && string.Equals(normalizedActualForAttempt, normalizedConfiguredCaption, StringComparison.Ordinal);
+                _log.Info(
+                    $"[VIDEO][CAPTION_INPUT_RESULT] attempt={attempt}/{strategies.Length} strategy={setResult.Mechanism} " +
+                    $"expectedLength={normalizedConfiguredCaption.Length} " +
+                    $"actualLength={(actualFoundForAttempt ? normalizedActualForAttempt.Length : -1)} " +
+                    $"exactMatch={exactCanonicalMatch.ToString().ToLowerInvariant()}");
+                if (exactCanonicalMatch) break;
+            }
+
+            var actualCaptionFound = finalSnapshot.Found;
+            var normalizedActualCaption = actualCaptionFound ? NormalizeDescription(finalSnapshot.CanonicalText) : "";
             var setFailureReason = exactCanonicalMatch
                 ? "NONE"
-                : !setResult.Success ? "FOCUS_OR_INPUT_DISPATCH_FAILED"
+                : !inputDispatched ? "FOCUS_OR_INPUT_DISPATCH_FAILED"
                 : !actualCaptionFound || normalizedActualCaption.Length == 0 ? "TEXT_NOT_COMMITTED"
                 : "CONTENT_MISMATCH";
             _log.Info(
                 $"[VIDEO][CAPTION_SET] mode={options.CaptionMode} length={normalizedConfiguredCaption.Length} " +
-                $"mechanism={setResult.Mechanism} result={(exactCanonicalMatch ? "OK" : "FAIL")} reason={setFailureReason}");
+                $"mechanism={finalMechanism} result={(exactCanonicalMatch ? "OK" : "FAIL")} reason={setFailureReason}");
             _log.Info(
                 $"[VIDEO][CAPTION_CANONICAL_READ] found={actualCaptionFound.ToString().ToLowerInvariant()} " +
-                $"rawInnerTextLength={settle.Item1.InnerText.Length} rawTextContentLength={settle.Item1.TextContent.Length} " +
-                $"canonicalLength={(actualCaptionFound ? normalizedActualCaption.Length : -1)} mentionCount={settle.Item1.MentionCount}");
+                $"rawInnerTextLength={finalSnapshot.InnerText.Length} rawTextContentLength={finalSnapshot.TextContent.Length} " +
+                $"canonicalLength={(actualCaptionFound ? normalizedActualCaption.Length : -1)} mentionCount={finalSnapshot.MentionCount}");
             _log.Info(
                 $"[VIDEO][CAPTION_VERIFY] mode={options.CaptionMode} expectedLength={normalizedConfiguredCaption.Length} " +
                 $"actualLength={(actualCaptionFound ? normalizedActualCaption.Length : -1)} " +
-                $"rawInnerTextLength={settle.Item1.InnerText.Length} rawTextContentLength={settle.Item1.TextContent.Length} " +
+                $"rawInnerTextLength={finalSnapshot.InnerText.Length} rawTextContentLength={finalSnapshot.TextContent.Length} " +
                 $"canonicalLength={(actualCaptionFound ? normalizedActualCaption.Length : -1)} " +
-                $"exactCanonicalMatch={exactCanonicalMatch.ToString().ToLowerInvariant()} mentionCount={settle.Item1.MentionCount} " +
+                $"exactCanonicalMatch={exactCanonicalMatch.ToString().ToLowerInvariant()} mentionCount={finalSnapshot.MentionCount} " +
                 $"result={(exactCanonicalMatch ? "PASS" : "FAIL")}");
             if (!exactCanonicalMatch)
                 throw new VideoUploadFlowException("CAPTION_VERIFY_FAILED", "Caption trong Description editor không khớp Caption cấu hình.");

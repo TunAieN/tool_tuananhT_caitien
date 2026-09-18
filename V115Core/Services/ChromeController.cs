@@ -4984,11 +4984,60 @@ public sealed partial class ChromeController : IAsyncDisposable
         LogCdpDone("InsertText", $"xpath={TrimForLog(xpath)} | len={text.Length}");
     }
 
-    public async Task InsertFocusedTextAsync(string text, CancellationToken ct = default)
+    public async Task TypeFocusedTextByKeyboardAsync(string text, int characterDelayMs = 15, CancellationToken ct = default)
     {
-        LogCdpStart("InsertFocusedText", $"len={text?.Length ?? 0}");
-        await Cdp.CallAsync("Input.insertText", new { text = text ?? "" }, ct);
-        LogCdpDone("InsertFocusedText", $"len={text?.Length ?? 0}");
+        text ??= "";
+        LogCdpStart("TypeFocusedTextByKeyboard", $"len={text.Length} | delayMs={characterDelayMs}");
+        var enumerator = System.Globalization.StringInfo.GetTextElementEnumerator(text);
+        while (enumerator.MoveNext())
+        {
+            ct.ThrowIfCancellationRequested();
+            var element = enumerator.GetTextElement();
+            var key = element == " " ? " " : element;
+            var code = element switch
+            {
+                " " => "Space",
+                "\n" => "Enter",
+                _ when element.Length == 1 && element[0] is >= 'a' and <= 'z' or >= 'A' and <= 'Z'
+                    => "Key" + char.ToUpperInvariant(element[0]),
+                _ when element.Length == 1 && char.IsDigit(element[0]) => "Digit" + element,
+                _ => ""
+            };
+            var virtualKeyCode = element switch
+            {
+                " " => 32,
+                "\n" => 13,
+                _ when element.Length == 1 && element[0] <= 0x7f => char.ToUpperInvariant(element[0]),
+                _ => 0
+            };
+            await Cdp.CallAsync("Input.dispatchKeyEvent", new
+            {
+                type = "rawKeyDown",
+                key,
+                code,
+                windowsVirtualKeyCode = (int)virtualKeyCode,
+                nativeVirtualKeyCode = (int)virtualKeyCode
+            }, ct);
+            await Cdp.CallAsync("Input.dispatchKeyEvent", new
+            {
+                type = "char",
+                key,
+                code,
+                text = element,
+                unmodifiedText = element
+            }, ct);
+            await Cdp.CallAsync("Input.dispatchKeyEvent", new
+            {
+                type = "keyUp",
+                key,
+                code,
+                windowsVirtualKeyCode = (int)virtualKeyCode,
+                nativeVirtualKeyCode = (int)virtualKeyCode
+            }, ct);
+            if (characterDelayMs > 0)
+                await Task.Delay(characterDelayMs, ct);
+        }
+        LogCdpDone("TypeFocusedTextByKeyboard", $"len={text.Length}");
     }
 
     public async Task PrepareKeyboardNavigationAsync(CancellationToken ct = default)
